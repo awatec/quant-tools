@@ -2,7 +2,7 @@ name: Claude Code Automation
 
 on:
   issues:
-    types: [opened, edited]
+    types: [opened, edited, labeled]   # ラベル運用にも対応
 
 permissions:
   contents: write
@@ -11,82 +11,84 @@ permissions:
 
 jobs:
   process-claude-code:
-    # タイトルに [CLAUDE-CODE] を含む issue のときだけ実行
-    if: contains(github.event.issue.title, '[CLAUDE-CODE]')
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Parse Issue Content
-        id: parse
+      # --- まずバリデーションだけ実行（ここで止めても Job は成功扱い） ---
+      - name: Validate trigger & extract metadata
+        id: validate
         run: |
-          echo "issue_number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
-          issue_body="${{ github.event.issue.body }}"
-          file_path=$(echo "$issue_body" | grep "^FILE_PATH:" | cut -d' ' -f2-)
-          echo "file_path=${file_path}" >> "$GITHUB_OUTPUT"
-          commit_msg=$(echo "$issue_body" | grep "^COMMIT_MSG:" | cut -d' ' -f2-)
-          [ -z "$commit_msg" ] && commit_msg="Claude auto-implementation"
-          echo "commit_msg=${commit_msg}" >> "$GITHUB_OUTPUT"
+          title="${{ github.event.issue.title }}"
+          body="${{ github.event.issue.body }}"
+          labels="${{ join(github.event.issue.labels.*.name, ',') }}"
+          echo "::group::Raw inputs"
+          echo "title=$title"
+          echo "labels=$labels"
+          echo "::endgroup::"
 
-      - name: Extract Code Content
-        run: |
-          issue_body="${{ github.event.issue.body }}"
-          # ```python ... ``` を最優先
-          echo "$issue_body" | awk '
-            BEGIN{inblock=0}
-            /^```[Pp]ython/{inblock=1; next}
-            /^```/{ if(inblock){inblock=0; exit} }
-            { if(inblock) print }
-          ' > code_content.tmp
+          ready="true"
 
-          # 見つからなければ任意の ``` ... ```
+          # ① タイトルに [CLAUDE-CODE] を要求
+          echo "$title" | grep -q "\[CLAUDE-CODE\]" || ready="false"
+
+          # ② FILE_PATH 行を抽出
+          file_path=$(printf "%s\n" "$body" | grep -E "^FILE_PATH:" | cut -d' ' -f2-)
+          [ -n "$file_path" ] || ready="false"
+
+          # ③ ```python または ``` のコードブロック検出
+          printf "%s\n" "$body" | awk 'BEGIN{s=0} /^```[Pp]ython/{s=1;next} /^```/{if(s){s=0;print "END"};next} {if(s)print}' > code_content.tmp
           if [ ! -s code_content.tmp ]; then
-            echo "$issue_body" | awk '
-              BEGIN{inblock=0}
-              /^```/{inblock=!inblock; next}
-              { if(inblock) print }
-            ' > code_content.tmp
+            printf "%s\n" "$body" | awk 'BEGIN{s=0} /^```/{s=1-s;next} {if(s)print}' > code_content.tmp
+          fi
+          [ -s code_content.tmp ] || ready="false"
+
+          # ④ ラベル運用にしたい場合は次行を外す（labels に 'claude-code' 必須）
+          # echo "$labels" | grep -qi 'claude-code' || ready="false"
+
+          # commit メッセージ
+          commit_msg=$(printf "%s\n" "$body" | grep -E "^COMMIT_MSG:" | cut -d' ' -f2-)
+          [ -n "$commit_msg" ] || commit_msg="Claude auto-implementation"
+
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          echo "file_path=$file_path" >> "$GITHUB_OUTPUT"
+          echo "commit_msg=$commit_msg" >> "$GITHUB_OUTPUT"
+
+          if [ "$ready" != "true" ]; then
+            echo "Not ready. Conditions not met. Job will exit successfully without actions."
           fi
 
-          if [ -s code_content.tmp ]; then
-            echo "Code extracted successfully"
-            head -5 code_content.tmp
-          else
-            echo "ERROR: No code found"
-            exit 1
-          fi
-
-      - name: Create File
+      # 以降は ready のときだけ実行
+      - name: Create file
+        if: steps.validate.outputs.ready == 'true'
         run: |
-          file_path="${{ steps.parse.outputs.file_path }}"
-          if [ -z "$file_path" ]; then
-            echo "ERROR: FILE_PATH missing"
-            exit 1
-          fi
+          file_path="${{ steps.validate.outputs.file_path }}"
           mkdir -p "$(dirname "$file_path")"
           cp code_content.tmp "$file_path"
-          echo "File created: $file_path"
+          echo "Created: $file_path"
+          head -5 "$file_path" || true
 
-      - name: Python Check
+      - name: Python syntax check (optional)
+        if: steps.validate.outputs.ready == 'true'
         run: |
-          file_path="${{ steps.parse.outputs.file_path }}"
-          if [[ "$file_path" == *.py ]]; then
-            python3 -m py_compile "$file_path" && echo "Syntax OK"
-          fi
+          fp="${{ steps.validate.outputs.file_path }}"
+          [[ "$fp" == *.py ]] && python3 -m py_compile "$fp" && echo "Syntax OK" || true
 
       - name: Create Pull Request
+        if: steps.validate.outputs.ready == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
-          title: "Claude Auto: ${{ steps.parse.outputs.file_path }}"
+          title: "Claude Auto: ${{ steps.validate.outputs.file_path }}"
           body: |
             Auto-generated by Claude
-            File: `${{ steps.parse.outputs.file_path }}`
-            Issue: #${{ steps.parse.outputs.issue_number }}
-          branch: claude-auto-${{ steps.parse.outputs.issue_number }}
-          commit-message: "${{ steps.parse.outputs.commit_msg }}"
+            File: `${{ steps.validate.outputs.file_path }}`
+            Issue: #${{ github.event.issue.number }}
+          branch: claude-auto-${{ github.event.issue.number }}
+          commit-message: "${{ steps.validate.outputs.commit_msg }}"
 
-      - name: Comment Success
+      - name: Comment success
+        if: steps.validate.outputs.ready == 'true'
         uses: actions/github-script@v7
         with:
           script: |
