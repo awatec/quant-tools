@@ -26,14 +26,14 @@ jobs:
         with:
           script: |
             const bodyRaw = context.payload.issue?.body ?? "";
-            // 改行/不可視文字の正規化
-            const body = bodyRaw.replace(/\r\n/g, "\n").replace(/\u00A0/g, " "); // NBSP → space
+            // 改行/不可視空白の正規化
+            const body = bodyRaw.replace(/\r\n/g, "\n").replace(/\u00A0/g, " ");
 
-            // FILE_PATH: または FILE_PATH： を許容（先頭/前スペース許容）
+            // FILE_PATH: / FILE_PATH： (前後スペース許容)
             const mPath = body.match(/^\s*FILE_PATH[:：]\s*(.+)\s*$/m);
             const file_path = mPath?.[1]?.trim() ?? "";
 
-            // COMMIT_MSG: または COMMIT_MSG： を許容
+            // COMMIT_MSG: / COMMIT_MSG：
             const mMsg = body.match(/^\s*COMMIT_MSG[:：]\s*(.+)\s*$/m);
             const commit_msg = (mMsg?.[1]?.trim() || "Claude auto-implementation");
 
@@ -46,8 +46,7 @@ jobs:
               const anyBlock = body.match(/```+\s*([\s\S]*?)```+/);
               if (anyBlock) code = anyBlock[1];
             }
-            // 先頭BOM除去
-            code = code.replace(/^\uFEFF/, "");
+            code = code.replace(/^\uFEFF/, ""); // BOM除去
 
             const ready = Boolean(file_path && code);
 
@@ -63,11 +62,7 @@ jobs:
             core.setOutput("commit_msg", commit_msg);
             core.setOutput("code_b64", Buffer.from(code, "utf8").toString("base64"));
 
-            if (!ready) {
-              core.notice("Required fields missing. Need [CLAUDE-CODE] title/label, FILE_PATH line, and a fenced code block (```python ... ```).");
-            }
-
-      # 追加のデバッグ出力（UIで一目で分かる）
+      # 解析結果を明示（不要ならこの step を削除）
       - name: Debug outputs
         run: |
           echo "ready=${{ steps.parse.outputs.ready }}"
@@ -75,11 +70,11 @@ jobs:
           echo "commit_msg=${{ steps.parse.outputs.commit_msg }}"
           echo "code_b64 length=$(echo "${{ steps.parse.outputs.code_b64 }}" | wc -c)"
 
-      # 不足時は成功で静かに終了（メールの失敗通知を出さない）
+      # 必須要素が無い場合は静かに成功終了（失敗メールを出さない）
       - name: Stop when not ready
         if: steps.parse.outputs.ready != 'true'
         run: |
-          echo "Not ready -> stop successfully."
+          echo "Not ready -> stop successfully (no PR)."
           exit 0
 
       - name: Write file from code
