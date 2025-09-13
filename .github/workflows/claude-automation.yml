@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   process-claude-code:
-    # タイトル [CLAUDE-CODE] か、ラベル claude-code のどちらかで起動
+    # タイトルに [CLAUDE-CODE] か、ラベル claude-code が付いたら起動
     if: contains(github.event.issue.title, '[CLAUDE-CODE]') || contains(join(github.event.issue.labels.*.name, ','), 'claude-code')
     runs-on: ubuntu-latest
 
@@ -19,19 +19,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 本文を JS で安全に解析（FILE_PATH / COMMIT_MSG / コード抽出）
+      # 本文解析（全角コロン/スペース許容、CRLF正規化）
       - name: Parse issue body
         id: parse
         uses: actions/github-script@v7
         with:
           script: |
-            const body = context.payload.issue?.body || "";
-            // FILE_PATH
-            const mPath = body.match(/^FILE_PATH:\s*(.+)$/m);
-            const file_path = (mPath?.[1] || "").trim();
-            // COMMIT_MSG
-            const mMsg = body.match(/^COMMIT_MSG:\s*(.+)$/m);
-            const commit_msg = (mMsg?.[1] || "Claude auto-implementation").trim();
+            const bodyRaw = context.payload.issue?.body ?? "";
+            // 改行/不可視文字の正規化
+            const body = bodyRaw.replace(/\r\n/g, "\n").replace(/\u00A0/g, " "); // NBSP → space
+
+            // FILE_PATH: または FILE_PATH： を許容（先頭/前スペース許容）
+            const mPath = body.match(/^\s*FILE_PATH[:：]\s*(.+)\s*$/m);
+            const file_path = mPath?.[1]?.trim() ?? "";
+
+            // COMMIT_MSG: または COMMIT_MSG： を許容
+            const mMsg = body.match(/^\s*COMMIT_MSG[:：]\s*(.+)\s*$/m);
+            const commit_msg = (mMsg?.[1]?.trim() || "Claude auto-implementation");
 
             // ```python ... ``` 優先、なければ最初の ``` ... ```
             let code = "";
@@ -42,23 +46,43 @@ jobs:
               const anyBlock = body.match(/```+\s*([\s\S]*?)```+/);
               if (anyBlock) code = anyBlock[1];
             }
-            // 余計な BOM/CR を整理
+            // 先頭BOM除去
             code = code.replace(/^\uFEFF/, "");
 
-            const ready = !!(file_path && code);
+            const ready = Boolean(file_path && code);
 
-            core.info(`ready=${ready} file_path="${file_path}" commit_msg="${commit_msg}"`);
+            core.startGroup("Parsed inputs");
+            core.info(`title=${context.payload.issue?.title}`);
+            core.info(`file_path="${file_path}"`);
+            core.info(`commit_msg="${commit_msg}"`);
+            core.info(`code_length=${code.length}`);
+            core.endGroup();
+
             core.setOutput("ready", String(ready));
             core.setOutput("file_path", file_path);
             core.setOutput("commit_msg", commit_msg);
             core.setOutput("code_b64", Buffer.from(code, "utf8").toString("base64"));
 
             if (!ready) {
-              core.notice("Required fields missing. Need [CLAUDE-CODE] title/label, FILE_PATH line, and a fenced code block.");
+              core.notice("Required fields missing. Need [CLAUDE-CODE] title/label, FILE_PATH line, and a fenced code block (```python ... ```).");
             }
 
+      # 追加のデバッグ出力（UIで一目で分かる）
+      - name: Debug outputs
+        run: |
+          echo "ready=${{ steps.parse.outputs.ready }}"
+          echo "file_path=${{ steps.parse.outputs.file_path }}"
+          echo "commit_msg=${{ steps.parse.outputs.commit_msg }}"
+          echo "code_b64 length=$(echo "${{ steps.parse.outputs.code_b64 }}" | wc -c)"
+
+      # 不足時は成功で静かに終了（メールの失敗通知を出さない）
+      - name: Stop when not ready
+        if: steps.parse.outputs.ready != 'true'
+        run: |
+          echo "Not ready -> stop successfully."
+          exit 0
+
       - name: Write file from code
-        if: steps.parse.outputs.ready == 'true'
         run: |
           FILE_PATH="${{ steps.parse.outputs.file_path }}"
           mkdir -p "$(dirname "$FILE_PATH")"
@@ -67,13 +91,11 @@ jobs:
           head -5 "$FILE_PATH" || true
 
       - name: Python syntax check (optional)
-        if: steps.parse.outputs.ready == 'true'
         run: |
           FILE_PATH="${{ steps.parse.outputs.file_path }}"
           [[ "$FILE_PATH" == *.py ]] && python3 -m py_compile "$FILE_PATH" && echo "Syntax OK" || true
 
       - name: Create Pull Request
-        if: steps.parse.outputs.ready == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           title: "Claude Auto: ${{ steps.parse.outputs.file_path }}"
@@ -85,7 +107,6 @@ jobs:
           commit-message: "${{ steps.parse.outputs.commit_msg }}"
 
       - name: Comment success
-        if: steps.parse.outputs.ready == 'true'
         uses: actions/github-script@v7
         with:
           script: |
